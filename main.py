@@ -5,7 +5,7 @@ app = FastAPI()
 
 VERSION = 5
 
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/lookup"
 
 DISTRICTS = [
     ("1257455", "Северное Бутово"),
