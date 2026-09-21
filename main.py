@@ -1,155 +1,246 @@
-from __future__ import annotations
-
-import json
-import time
-from typing import Any
-
+from fastapi import FastAPI, HTTPException
 import requests
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
+import time
 
-app = FastAPI(title="ExploreMap City Server", version="3.0")
+app = FastAPI(title="ExploreMapCityServer")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+VERSION = 4
 
-# Реальные административные районы Москвы.
-# Это не ЖК и не отдельные кварталы.
-SOUTHWEST_DISTRICTS = [
-    ("Северное Бутово", 1257455),
-    ("Южное Бутово", 1257403),
-    ("Ясенево", 951334),
-    ("Тёплый Стан", 951336),
-    ("Чертаново Южное", 950664),
-    ("Чертаново Центральное", 951305),
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+
+HEADERS = {
+    "User-Agent": "ExploreMap/1.0"
+}
+
+CITY_ID = "moscow"
+CITY_NAME = "Москва"
+
+CITY_BBOX = [37.15, 55.48, 37.95, 56.02]
+
+DISTRICTS = [
+    ("1257455", "Северное Бутово"),
+    ("1257403", "Южное Бутово"),
+    ("951334", "Ясенево"),
+    ("951336", "Тёплый Стан"),
+    ("950664", "Чертаново Южное"),
+    ("951305", "Чертаново Центральное"),
 ]
 
-PACK_BBOX = [
-    37.4558032,
-    55.4906574,
-    37.6333166,
-    55.6494629,
-]
+district_cache = None
+city_cache = None
+last_load = 0
 
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/lookup"
-USER_AGENT = "ExploreMap/1.0 (GPS exploration game)"
 
-last_nominatim_request = 0.0
+# ---------------------------------------------------------
+# Nominatim
+# ---------------------------------------------------------
 
+def nominatim_search(query: str):
+    response = requests.get(
+        NOMINATIM_URL,
+        params={
+            "q": query,
+            "format": "json",
+            "polygon_geojson": 1,
+            "limit": 1,
+            "addressdetails": 1,
+        },
+        headers=HEADERS,
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if not data:
+        return None
+
+    return data[0]
+
+
+# ---------------------------------------------------------
+# Районы
+# ---------------------------------------------------------
+
+def load_districts():
+    global district_cache
+
+    if district_cache is not None:
+        return district_cache
+
+    features = []
+
+    for osm_id, name in DISTRICTS:
+        try:
+            result = nominatim_search(
+                f"{name}, Москва, Россия"
+            )
+
+            if not result:
+                print(f"Не найден район: {name}")
+                continue
+
+            geometry = result.get("geojson")
+
+            if not geometry:
+                print(f"Нет geometry: {name}")
+                continue
+
+            features.append({
+                "type": "Feature",
+                "properties": {
+                    "district_id": osm_id,
+                    "name": name,
+                },
+                "geometry": geometry,
+            })
+
+            print(f"Загружен район: {name}")
+
+            # Nominatim не надо долбить слишком быстро
+            time.sleep(1)
+
+        except Exception as e:
+            print(f"Ошибка района {name}: {e}")
+
+    district_cache = {
+        "type": "FeatureCollection",
+        "features": features,
+    }
+
+    return district_cache
+
+
+# ---------------------------------------------------------
+# ГРАНИЦА МОСКВЫ
+# ---------------------------------------------------------
+
+def load_city():
+    global city_cache
+
+    if city_cache is not None:
+        return city_cache
+
+    print("Загружаю границу Москвы через Overpass...")
+
+    query = """
+    [out:json][timeout:120];
+
+    relation
+      ["boundary"="administrative"]
+      ["name"="Москва"]
+      ["admin_level"="4"];
+
+    out geom;
+    """
+
+    response = requests.post(
+        OVERPASS_URL,
+        data=query,
+        headers=HEADERS,
+        timeout=150,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    features = []
+
+    for element in data.get("elements", []):
+
+        geometry = []
+
+        for member in element.get("members", []):
+            if member.get("type") != "way":
+                continue
+
+            coords = []
+
+            for point in member.get("geometry", []):
+                coords.append([
+                    point["lon"],
+                    point["lat"]
+                ])
+
+            if len(coords) >= 2:
+                geometry.append(coords)
+
+        if not geometry:
+            continue
+
+        # Собираем линии в MultiLineString.
+        # MapLibre сможет показать их как границу.
+        features.append({
+            "type": "Feature",
+            "properties": {
+                "city_id": CITY_ID,
+                "name": CITY_NAME,
+            },
+            "geometry": {
+                "type": "MultiLineString",
+                "coordinates": geometry,
+            },
+        })
+
+    if not features:
+        raise RuntimeError(
+            "Overpass не вернул границу Москвы"
+        )
+
+    city_cache = {
+        "type": "FeatureCollection",
+        "features": features,
+    }
+
+    print(
+        f"Граница Москвы загружена: "
+        f"{len(features)} объектов"
+    )
+
+    return city_cache
+
+
+# ---------------------------------------------------------
+# API
+# ---------------------------------------------------------
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "version": 3,
-    }
-
-
-def download_districts() -> dict[str, Any]:
-    global last_nominatim_request
-
-    wait = 1.1 - (time.time() - last_nominatim_request)
-
-    if wait > 0:
-        time.sleep(wait)
-
-    ids = ",".join(
-        f"R{relation_id}"
-        for _, relation_id in SOUTHWEST_DISTRICTS
-    )
-
-    response = requests.get(
-        NOMINATIM_URL,
-        params={
-            "osm_ids": ids,
-            "format": "geojson",
-            "polygon_geojson": 1,
-            "polygon_threshold": 0.00001,
-            "accept-language": "ru",
-        },
-        headers={
-            "User-Agent": USER_AGENT,
-        },
-        timeout=60,
-    )
-
-    last_nominatim_request = time.time()
-
-    response.raise_for_status()
-
-    raw = response.json()
-
-    features = raw.get("features", [])
-
-    wanted = {
-        str(relation_id): name
-        for name, relation_id in SOUTHWEST_DISTRICTS
-    }
-
-    result_features = []
-
-    for feature in features:
-        props = feature.get("properties") or {}
-
-        osm_id = str(props.get("osm_id", ""))
-
-        if osm_id not in wanted:
-            continue
-
-        geometry = feature.get("geometry")
-
-        if not geometry:
-            continue
-
-        name = wanted[osm_id]
-
-        result_features.append(
-            {
-                "type": "Feature",
-                "properties": {
-                    "district_id": osm_id,
-                    "osm_id": int(osm_id),
-                    "name": name,
-                    "admin_level": 8,
-                },
-                "geometry": geometry,
-            }
-        )
-
-    if not result_features:
-        raise RuntimeError(
-            "Nominatim не вернул ни одного района"
-        )
-
-    if not any(
-        f["properties"]["district_id"] == "1257455"
-        for f in result_features
-    ):
-        raise RuntimeError(
-            "Не удалось получить геометрию Северного Бутово"
-        )
-
-    return {
-        "type": "FeatureCollection",
-        "features": result_features,
+        "version": VERSION,
+        "city": CITY_NAME,
     }
 
 
 @app.get("/api/v1/city-districts")
 def city_districts(
-    latitude: float = Query(..., ge=-90, le=90),
-    longitude: float = Query(..., ge=-180, le=180),
+    latitude: float,
+    longitude: float,
 ):
-    geojson = download_districts()
+    try:
+        districts = load_districts()
+        city = load_city()
 
-    return {
-        "version": 3,
-        "city_id": "moscow_southwest",
-        "city_name": "Москва",
-        "city_bbox": PACK_BBOX,
-        "geojson": geojson,
-    }
+        return {
+            "version": VERSION,
+
+            "city_id": CITY_ID,
+            "city_name": CITY_NAME,
+            "city_bbox": CITY_BBOX,
+
+            "geojson": districts,
+
+            "city_geojson": city,
+        }
+
+    except Exception as e:
+        print("API ERROR:", e)
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        )
