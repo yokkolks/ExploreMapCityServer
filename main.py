@@ -165,7 +165,7 @@ def query_districts(
 
 def build_payload(city_name: str, country: str, bbox: list[float], features: list[dict[str, Any]]) -> dict[str, Any]:
     return {
-        "version": 2,
+        "version": 3,
         "source": f"Overture Maps divisions {RELEASE}",
         "city_id": f"{country}_{slug(city_name)}",
         "city_name": city_name,
